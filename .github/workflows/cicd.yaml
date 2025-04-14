@@ -1,0 +1,201 @@
+name: Backend Services CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AZURE_CONTAINER_REGISTRY: acrdigitalgarage02.azurecr.io
+  CONTAINER_REGISTRY_ORGANIZATION: dg0310
+  NAMESPACE: dg0310-lifesub-ns
+
+jobs:
+  load-env:
+    runs-on: ubuntu-latest
+    outputs:
+      teamid: ${{ steps.load-env.outputs.teamid }}
+      root_project: ${{ steps.load-env.outputs.root_project }}
+      replicas: ${{ steps.load-env.outputs.replicas }}
+      resources_requests_cpu: ${{ steps.load-env.outputs.resources_requests_cpu }}
+      resources_requests_memory: ${{ steps.load-env.outputs.resources_requests_memory }}
+      resources_limits_cpu: ${{ steps.load-env.outputs.resources_limits_cpu }}
+      resources_limits_memory: ${{ steps.load-env.outputs.resources_limits_memory }}
+      registry: ${{ steps.load-env.outputs.registry }}
+      image_org: ${{ steps.load-env.outputs.image_org }}
+      allowed_origins: ${{ steps.load-env.outputs.allowed_origins }}
+      jwt_secret_key: ${{ steps.load-env.outputs.jwt_secret_key }}
+      postgres_user: ${{ steps.load-env.outputs.postgres_user }}
+      postgres_password: ${{ steps.load-env.outputs.postgres_password }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load environment variables
+        id: load-env
+        run: |
+          echo "teamid=$(grep -v '^#' deployment/deploy_env_vars | grep 'teamid=' | cut -d'=' -f2)" >> $GITHUB_OUTPUT
+          echo "root_project=$(grep -v '^#' deployment/deploy_env_vars | grep 'root_project=' | cut -d'=' -f2)" >> $GITHUB_OUTPUT
+          echo "replicas=$(grep -v '^#' deployment/deploy_env_vars | grep 'replicas=' | cut -d'=' -f2)" >> $GITHUB_OUTPUT
+          echo "resources_requests_cpu=$(grep -v '^#' deployment/deploy_env_vars | grep 'resources_requests_cpu=' | cut -d'=' -f2)" >> $GITHUB_OUTPUT
+          echo "resources_requests_memory=$(grep -v '^#' deployment/deploy_env_vars | grep 'resources_requests_memory=' | cut -d'=' -f2)" >> $GITHUB_OUTPUT
+          echo "resources_limits_cpu=$(grep -v '^#' deployment/deploy_env_vars | grep 'resources_limits_cpu=' | cut -d'=' -f2)" >> $GITHUB_OUTPUT
+          echo "resources_limits_memory=$(grep -v '^#' deployment/deploy_env_vars | grep 'resources_limits_memory=' | cut -d'=' -f2)" >> $GITHUB_OUTPUT
+          echo "registry=$(grep -v '^#' deployment/deploy_env_vars | grep 'registry=' | cut -d'=' -f2)" >> $GITHUB_OUTPUT
+          echo "image_org=$(grep -v '^#' deployment/deploy_env_vars | grep 'image_org=' | cut -d'=' -f2)" >> $GITHUB_OUTPUT
+          echo "allowed_origins=$(grep -v '^#' deployment/deploy_env_vars | grep 'allowed_origins=' | cut -d'=' -f2)" >> $GITHUB_OUTPUT
+          echo "jwt_secret_key=$(grep -v '^#' deployment/deploy_env_vars | grep 'jwt_secret_key=' | cut -d'=' -f2)" >> $GITHUB_OUTPUT
+          echo "postgres_user=$(grep -v '^#' deployment/deploy_env_vars | grep 'postgres_user=' | cut -d'=' -f2)" >> $GITHUB_OUTPUT
+          echo "postgres_password=$(grep -v '^#' deployment/deploy_env_vars | grep 'postgres_password=' | cut -d'=' -f2)" >> $GITHUB_OUTPUT
+
+  build-and-test:
+    needs: load-env
+    strategy:
+      matrix:
+        service: [member, mysub, recommend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build with Gradle
+        run: ./gradlew :${{ matrix.service }}:build -x test
+
+      - name: Run tests
+        run: ./gradlew :${{ matrix.service }}:test
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.service }}-build
+          path: ${{ matrix.service }}/build/libs/*.jar
+
+  sonarqube-analysis:
+    needs: build-and-test
+    strategy:
+      matrix:
+        service: [member, mysub, recommend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: SonarQube Analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          ./gradlew :${{ matrix.service }}:sonar \
+            -Dsonar.projectKey=lifesub-${{ matrix.service }}-dg0310 \
+            -Dsonar.projectName="Lifesub ${{ matrix.service }} Service" \
+            -Dsonar.host.url=$SONAR_HOST_URL \
+            -Dsonar.token=$SONAR_TOKEN
+
+  release:
+    needs: [load-env, sonarqube-analysis]
+    strategy:
+      matrix:
+        service: [member, mysub, recommend]
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.image-tag.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Generate Image Tag
+        id: image-tag
+        run: |
+          echo "tag=$(date +'%Y%m%d%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: Login to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ needs.load-env.outputs.registry }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.service }}-build
+          path: ${{ matrix.service }}/build/libs
+
+      - name: Build and Push Docker Image
+        run: |
+          docker build \
+            --build-arg BUILD_LIB_DIR="${{ matrix.service }}/build/libs" \
+            --build-arg ARTIFACTORY_FILE="${{ matrix.service }}.jar" \
+            -f deployment/container/Dockerfile \
+            -t ${{ needs.load-env.outputs.registry }}/${{ needs.load-env.outputs.image_org }}/${{ matrix.service }}:${{ steps.image-tag.outputs.tag }} .
+          
+          docker push ${{ needs.load-env.outputs.registry }}/${{ needs.load-env.outputs.image_org }}/${{ matrix.service }}:${{ steps.image-tag.outputs.tag }}
+
+  deploy:
+    needs: [load-env, release]
+    strategy:
+      matrix:
+        service: [member, mysub, recommend]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Generate Deployment Manifest
+        env:
+          NAMESPACE: ${{ needs.load-env.outputs.namespace }}
+          ALLOWED_ORIGINS: ${{ needs.load-env.outputs.allowed_origins }}
+          JWT_SECRET_KEY: ${{ needs.load-env.outputs.jwt_secret_key }}
+          POSTGRES_USER: ${{ needs.load-env.outputs.postgres_user }}
+          POSTGRES_PASSWORD: ${{ needs.load-env.outputs.postgres_password }}
+          REPLICAS: ${{ needs.load-env.outputs.replicas }}
+          RESOURCES_REQUESTS_CPU: ${{ needs.load-env.outputs.resources_requests_cpu }}
+          RESOURCES_REQUESTS_MEMORY: ${{ needs.load-env.outputs.resources_requests_memory }}
+          RESOURCES_LIMITS_CPU: ${{ needs.load-env.outputs.resources_limits_cpu }}
+          RESOURCES_LIMITS_MEMORY: ${{ needs.load-env.outputs.resources_limits_memory }}
+          IMAGE_TAG: ${{ needs.release.outputs.image_tag }}
+        run: |
+          export MEMBER_IMAGE_PATH=${{ needs.load-env.outputs.registry }}/${{ needs.load-env.outputs.image_org }}/member:$IMAGE_TAG
+          export MYSUB_IMAGE_PATH=${{ needs.load-env.outputs.registry }}/${{ needs.load-env.outputs.image_org }}/mysub:$IMAGE_TAG
+          export RECOMMEND_IMAGE_PATH=${{ needs.load-env.outputs.registry }}/${{ needs.load-env.outputs.image_org }}/recommend:$IMAGE_TAG
+          
+          envsubst < deployment/deploy.yaml.template > deployment/deploy.yaml
+          
+          echo "Generated Manifest for ${{ matrix.service }}:"
+          cat deployment/deploy.yaml
+
+      - name: Deploy to AKS
+        run: |
+          az aks get-credentials --resource-group rg-digitalgarage-02 --name aks-digitalgarage-02
+          kubectl apply -f deployment/deploy.yaml
+          kubectl -n ${{ needs.load-env.outputs.namespace }} rollout status deployment/${{ matrix.service }}
