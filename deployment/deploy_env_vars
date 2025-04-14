@@ -17,7 +17,7 @@ resources_requests_memory=256Mi
 resources_limits_cpu=1024m
 resources_limits_memory=1024Mi
 
-# Security Settings
+# Security Settings #
 jwt_secret_key=randomSecretKeyForDeployment
 postgres_user=admin
 postgres_password=StrongPassword123!
